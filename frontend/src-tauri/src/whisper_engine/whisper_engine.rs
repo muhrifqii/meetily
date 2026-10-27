@@ -549,6 +549,62 @@ impl WhisperEngine {
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        self.transcribe_live(audio_data, language, None, false).await
+    }
+
+    /// Transcription with a user glossary as whisper's prompt.
+    ///
+    /// Given a near-silent or unclear segment, whisper sometimes answers with its
+    /// prompt instead of the speech, which replaces what was said with glossary
+    /// terms. A result made almost entirely of glossary words is therefore decoded
+    /// again without the prompt.
+    pub async fn transcribe_with_glossary(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+        glossary: Option<&str>,
+        fast: bool,
+    ) -> Result<(String, f32, bool)> {
+        let Some(glossary) = glossary else {
+            return self.transcribe_live(audio_data, language, None, fast).await;
+        };
+        let result = self
+            .transcribe_live(audio_data.clone(), language.clone(), Some(glossary), fast)
+            .await?;
+        if Self::echoes_prompt(&result.0, glossary) {
+            log::info!("Result echoes the glossary prompt, decoding without it: '{}'", result.0);
+            return self.transcribe_live(audio_data, language, None, fast).await;
+        }
+        Ok(result)
+    }
+
+    /// True when at least 80% of the words in `text` come from `prompt`.
+    fn echoes_prompt(text: &str, prompt: &str) -> bool {
+        let words = |s: &str| -> Vec<String> {
+            s.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .map(str::to_lowercase)
+                .collect()
+        };
+        let prompt_words: HashSet<String> = words(prompt).into_iter().collect();
+        let text_words = words(text);
+        let from_prompt = text_words.iter().filter(|w| prompt_words.contains(*w)).count();
+        !text_words.is_empty() && from_prompt * 5 >= text_words.len() * 4
+    }
+
+    /// Live-path transcription.
+    ///
+    /// `prompt` is the tail of the previously finalized transcript; whisper decodes the
+    /// segment as a continuation of it, which keeps names, terms and sentence flow
+    /// consistent across segment boundaries. `fast` switches to greedy decoding for
+    /// interim captions, which are replaced by the final result moments later.
+    pub async fn transcribe_live(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+        prompt: Option<&str>,
+        fast: bool,
+    ) -> Result<(String, f32, bool)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -558,10 +614,22 @@ impl WhisperEngine {
         let adaptive_config = hardware_profile.get_whisper_config();
 
         // ADAPTIVE parameters - optimized for current hardware
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: adaptive_config.beam_size as i32,
-            patience: 1.0
-        });
+        // No reduced audio_ctx for interims: shrinking the encoder window made
+        // whisper loop and emit foreign-script tokens on AMI ES2004a.
+        let mut params = if fast {
+            FullParams::new(SamplingStrategy::Greedy { best_of: 1 })
+        } else {
+            FullParams::new(SamplingStrategy::BeamSearch {
+                beam_size: adaptive_config.beam_size as i32,
+                patience: 1.0
+            })
+        };
+        if let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) {
+            params.set_initial_prompt(prompt);
+        }
+        if let Some(max_threads) = adaptive_config.max_threads {
+            params.set_n_threads(max_threads as i32);
+        }
 
         // Configure with adaptive settings
         // If language is "auto" or None, use automatic language detection (pass None)
@@ -601,12 +669,6 @@ impl WhisperEngine {
         params.set_no_speech_thold(0.55);
         params.set_max_len(200);
         params.set_single_segment(false);
-
-        // Set thread count based on hardware (if supported by whisper.cpp)
-        if let Some(_max_threads) = adaptive_config.max_threads {
-            // Note: whisper.cpp may or may not expose thread control through params
-            // Removed debug log to reduce I/O overhead in transcription hot path
-        }
 
         let duration_seconds = audio_data.len() as f64 / 16000.0;
         let is_partial = duration_seconds < 15.0; // Consider chunks under 15s as partial

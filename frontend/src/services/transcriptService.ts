@@ -7,7 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
-import { TranscriptUpdate, Transcript } from '@/types';
+import { TranscriptUpdate, Transcript, InterimUpdate } from '@/types';
 
 export interface TranscriptionStatus {
   chunks_in_queue: number;
@@ -56,6 +56,17 @@ export class TranscriptService {
    */
   async onTranscriptUpdate(callback: (update: TranscriptUpdate) => void): Promise<UnlistenFn> {
     return listen<TranscriptUpdate>('transcript-update', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for interim captions of the segment still being spoken
+   * @param callback - Function to call with each interim caption
+   * @returns Promise that resolves to unlisten function
+   */
+  async onTranscriptInterim(callback: (update: InterimUpdate) => void): Promise<UnlistenFn> {
+    return listen<InterimUpdate>('transcript-interim', (event) => {
       callback(event.payload);
     });
   }

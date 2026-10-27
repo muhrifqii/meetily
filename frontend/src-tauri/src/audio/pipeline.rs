@@ -11,20 +11,14 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
-use super::vad::{ContinuousVadProcessor};
+use super::live_segmenter::{LiveSegmenter, LiveSegmenterConfig};
+use super::transcription::worker::{clear_interim, publish_interim};
 
-/// How long a silence must last before the VAD closes a speech segment, and
-/// therefore how long the audio clips handed to the ASR engine are.
-///
-/// Live-path policy: 500ms (matches the established Meetily Pro live policy).
-/// The batch paths (`import.rs` / `retranscription.rs`) use 2000ms instead —
-/// they have no latency requirement, so they optimize purely for ASR request
-/// length. The live path cannot: with continuous audio (e.g. a podcast played
-/// as system audio) a 2000ms redemption keeps one VAD segment open
-/// indefinitely, withholds live transcript emission, and overruns the
-/// accumulated-speech-buffer warning threshold. Bounded live segmentation
-/// during continuous speech is tracked separately in #756.
-const VAD_REDEMPTION_TIME_MS: u32 = 500;
+// Live segmentation policy lives in `live_segmenter.rs`: the pause that closes a
+// segment shrinks as the segment grows (900ms → 400ms past 8s → 330ms past 20s),
+// so segments are long enough for context yet bounded under continuous speech
+// (#756), and the open segment is shown as an interim caption while it is spoken.
+// The batch paths (`import.rs` / `retranscription.rs`) keep their fixed 2000ms.
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -694,7 +688,7 @@ pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
     state: Arc<RecordingState>,
-    vad_processor: ContinuousVadProcessor,
+    vad_processor: LiveSegmenter,
     sample_rate: u32,
     chunk_id_counter: u64,
     // Performance optimization: reduce logging frequency
@@ -732,35 +726,18 @@ impl AudioPipeline {
         // For now, we log it for monitoring and potential optimization
         let _ = (mic_device_name, mic_device_kind, system_device_name, system_device_kind);
 
-        // Create VAD processor. The VAD processor handles 48kHz->16kHz resampling
+        // Create the live segmenter. Its VAD handles 48kHz->16kHz resampling
         // internally.
         //
-        // Redemption time is how long a silence must last before the VAD closes a
-        // speech segment, so it decides how long the audio clips handed to the ASR
-        // engine are. Conversational speech pauses constantly for breath and
-        // mid-sentence thought, and every pause longer than this becomes a segment
-        // boundary and therefore a separate transcription request.
-        //
-        // This was 400ms, which fragmented a 26-minute meeting into 322 requests with
-        // a median length of 3.5s. Whisper is a fixed 30-second-window model: below
-        // that it zero-pads the window and leans on its language-model prior, which
-        // was trained on web subtitles, so short clips come back as memorised
-        // boilerplate ("subscribe to the channel", "thank you") instead of speech.
-        // Measured on a real recording, 47% of segment boundaries sat in the
-        // 0.42-0.75s range that a longer redemption bridges.
-        //
-        // 500ms is the live-path policy (see the constant's doc comment). The
-        // batch value (2000ms, `import.rs`/`retranscription.rs`) was tried here
-        // first, but under continuous system audio it kept a VAD segment open
-        // indefinitely and withheld live transcript emission, so live and batch
-        // deliberately diverge. Bounded live segments under continuous speech
-        // are tracked in #756.
-        let vad_processor =
-            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
-        info!(
-            "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
-            VAD_REDEMPTION_TIME_MS
-        );
+        // Every pause long enough to close a segment becomes a separate
+        // transcription request. A fixed 400-500ms pause fragmented a 26-minute
+        // meeting into 322 requests with a median length of 3.5s; whisper zero-pads
+        // such clips to its 30-second window and fills them from its subtitle prior
+        // ("subscribe to the channel", "thank you"). A fixed 2000ms pause, as in
+        // batch, never closes a segment under continuous system audio (#756). The
+        // segmenter instead shrinks the pause as the open segment grows.
+        let vad_processor = LiveSegmenter::new(sample_rate, LiveSegmenterConfig::default())?;
+        info!("VAD-driven pipeline: adaptive live segmentation with interim captions");
 
         // Initialize professional audio mixing components
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
@@ -859,6 +836,10 @@ impl AudioPipeline {
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
                             match self.vad_processor.process_audio(&mixed_with_gain) {
                                 Ok(speech_segments) => {
+                                    if !speech_segments.is_empty() {
+                                        // A pending snapshot belongs to the segment that just closed.
+                                        clear_interim();
+                                    }
                                     for segment in speech_segments {
                                         let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
@@ -888,6 +869,10 @@ impl AudioPipeline {
                                 Err(e) => {
                                     warn!("⚠️ VAD error: {}", e);
                                 }
+                            }
+
+                            if let Some(snapshot) = self.vad_processor.take_interim() {
+                                publish_interim(snapshot);
                             }
 
                             // STEP 4: Send mixed audio for recording (WAV file)
@@ -926,6 +911,7 @@ impl AudioPipeline {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
 
         // Flush any remaining audio from VAD processor and send segments to transcription
+        clear_interim();
         match self.vad_processor.flush() {
             Ok(final_segments) => {
                 for segment in final_segments {
@@ -1100,17 +1086,5 @@ impl AudioPipelineManager {
 impl Default for AudioPipelineManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_live_vad_redemption_matches_pro_policy() {
-        // Live uses the established 500ms pause policy; it does not bound
-        // uninterrupted speech. Batch import/retranscription use 2000ms.
-        // See #679 and #756.
-        assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
     }
 }

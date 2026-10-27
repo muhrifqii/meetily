@@ -4,6 +4,8 @@
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
+use crate::audio::live_segmenter::InterimSnapshot;
+use crate::whisper_engine::WhisperEngine;
 use crate::audio::AudioChunk;
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,174 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+}
+
+/// Caption for the segment still being spoken. Replaced by the next interim for
+/// the same segment, and by the `transcript-update` whose `audio_start_time`
+/// equals `segment_start_time`. Never persisted.
+#[derive(Debug, Serialize, Clone)]
+pub struct InterimUpdate {
+    pub text: String,
+    pub segment_start_time: f64,
+    pub audio_end_time: f64,
+}
+
+// Latest-wins slot for interim snapshots: a caption is only worth computing for
+// the newest audio, so a snapshot the worker had no time for is overwritten.
+static INTERIM_SLOT: std::sync::Mutex<Option<InterimSnapshot>> = std::sync::Mutex::new(None);
+static INTERIM_NOTIFY: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
+pub fn publish_interim(snapshot: InterimSnapshot) {
+    if *INTERIM_MODEL_PREFERENCE.lock().unwrap() == "off" {
+        return;
+    }
+    *INTERIM_SLOT.lock().unwrap() = Some(snapshot);
+    INTERIM_NOTIFY.notify_one();
+}
+
+pub fn clear_interim() {
+    INTERIM_SLOT.lock().unwrap().take();
+}
+
+/// Model for interim captions: "same" as the final engine, "off", or a Whisper
+/// model name (e.g. "small"), which then gets its own engine so the final model
+/// keeps its settings. Set from the frontend; applies from the next caption.
+static INTERIM_MODEL_PREFERENCE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Dedicated interim engine and the model it holds. A load failure (typically the
+/// model not downloaded yet) is remembered for `INTERIM_RETRY` so the worker does
+/// not retry it every second, yet picks the model up once it has been downloaded.
+static INTERIM_ENGINE: tokio::sync::Mutex<Option<(String, Option<Arc<WhisperEngine>>, std::time::Instant)>> =
+    tokio::sync::Mutex::const_new(None);
+const INTERIM_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub async fn set_interim_model_preference(model: String) {
+    *INTERIM_MODEL_PREFERENCE.lock().unwrap() = model;
+    // Release a dedicated engine that is no longer wanted.
+    let wanted = dedicated_interim_model();
+    let mut engine = INTERIM_ENGINE.lock().await;
+    if engine.as_ref().map(|(name, _, _)| Some(name.as_str()) != wanted.as_deref()).unwrap_or(false) {
+        *engine = None;
+    }
+}
+
+fn dedicated_interim_model() -> Option<String> {
+    let pref = INTERIM_MODEL_PREFERENCE.lock().unwrap().clone();
+    match pref.as_str() {
+        "" | "same" | "off" => None,
+        _ => Some(pref),
+    }
+}
+
+/// Returns the dedicated interim engine, loading it on first use. None means
+/// "use the final engine": no dedicated model is set, or it failed to load.
+async fn dedicated_interim_engine() -> Option<Arc<WhisperEngine>> {
+    let model = dedicated_interim_model()?;
+    let mut slot = INTERIM_ENGINE.lock().await;
+    if let Some((name, engine, at)) = slot.as_ref() {
+        if *name == model && (engine.is_some() || at.elapsed() < INTERIM_RETRY) {
+            return engine.clone();
+        }
+    }
+    let loaded = async {
+        let engine = WhisperEngine::new_with_models_dir(crate::whisper_engine::commands::get_models_directory())?;
+        engine.discover_models().await?;
+        engine.load_model(&model).await?;
+        anyhow::Ok(Arc::new(engine))
+    }
+    .await;
+    let engine = match loaded {
+        Ok(engine) => {
+            info!("Loaded '{}' for interim captions", model);
+            Some(engine)
+        }
+        Err(e) => {
+            warn!("Interim caption model '{}' unavailable, using the transcript model: {}", model, e);
+            None
+        }
+    };
+    *slot = Some((model, engine.clone(), std::time::Instant::now()));
+    engine
+}
+
+enum Work {
+    Final(Option<AudioChunk>),
+    Interim,
+}
+
+/// A user correction: `from` (as it was transcribed) is replaced by `to`
+/// wherever it stands as whole words, case-insensitively.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Correction {
+    pub from: String,
+    pub to: String,
+}
+
+/// Whisper reads at most 224 prompt tokens; the glossary stays well inside that.
+const GLOSSARY_PROMPT_MAX_CHARS: usize = 600;
+
+// User transcription hints, set from the frontend and applied from the next segment.
+static GLOSSARY_PROMPT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static CORRECTIONS: std::sync::Mutex<Vec<Correction>> = std::sync::Mutex::new(Vec::new());
+
+/// Corrections rewrite every transcribed text. Glossary terms become whisper's
+/// prompt only when `use_prompt` is set: the prompt fixes spelling of names and
+/// jargon, but on AMI ES2004a it also made whisper drop speech (WER 23.2% ->
+/// 29.5%, deletions 486 -> 619), so it is opt-in. Terms are listed oldest
+/// first; over budget, the oldest are dropped.
+pub fn set_transcription_hints(terms: Vec<String>, corrections: Vec<Correction>, use_prompt: bool) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut len = 0;
+    for term in terms.iter().rev().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        if len + term.len() + 2 > GLOSSARY_PROMPT_MAX_CHARS {
+            break;
+        }
+        len += term.len() + 2;
+        kept.push(term);
+    }
+    kept.reverse();
+    *GLOSSARY_PROMPT.lock().unwrap() =
+        (use_prompt && !kept.is_empty()).then(|| format!("Glossary: {}.", kept.join(", ")));
+    *CORRECTIONS.lock().unwrap() = corrections
+        .into_iter()
+        .filter(|c| !c.from.trim().is_empty())
+        .collect();
+}
+
+fn glossary_prompt() -> Option<String> {
+    GLOSSARY_PROMPT.lock().unwrap().clone()
+}
+
+fn apply_corrections(text: &str) -> String {
+    CORRECTIONS
+        .lock()
+        .unwrap()
+        .iter()
+        .fold(text.to_string(), |out, c| replace_words_ci(&out, c.from.trim(), &c.to))
+}
+
+/// Replaces `from` with `to` where it stands as whole words, ignoring case.
+fn replace_words_ci(text: &str, from: &str, to: &str) -> String {
+    let lower = text.to_lowercase();
+    let needle = from.to_lowercase();
+    // Byte offsets in `lower` index `text` only when lowercasing kept every length.
+    if needle.is_empty() || lower.len() != text.len() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find(&needle) {
+        let start = i + pos;
+        let end = start + needle.len();
+        let whole_word = !text[..start].chars().next_back().map_or(false, char::is_alphanumeric)
+            && !text[end..].chars().next().map_or(false, char::is_alphanumeric);
+        out.push_str(&text[i..start]);
+        out.push_str(if whole_word { to } else { &text[start..end] });
+        i = end;
+    }
+    out.push_str(&text[i..]);
+    out
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -117,11 +287,28 @@ pub fn start_transcription_task<R: Runtime>(
                     warn!("⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped", worker_id, engine_name);
                 }
 
+                // Load a dedicated interim model now rather than on the first caption.
+                let _ = dedicated_interim_engine().await;
+
                 loop {
-                    // Try to get a chunk to process
-                    let chunk = {
+                    // Finals first; the latest interim snapshot only when no final is waiting.
+                    let work = {
                         let mut receiver = work_receiver_clone.lock().await;
-                        receiver.recv().await
+                        tokio::select! {
+                            biased;
+                            chunk = receiver.recv() => Work::Final(chunk),
+                            _ = INTERIM_NOTIFY.notified() => Work::Interim,
+                        }
+                    };
+                    let chunk = match work {
+                        Work::Final(chunk) => chunk,
+                        Work::Interim => {
+                            let snapshot = INTERIM_SLOT.lock().unwrap().take();
+                            if let Some(snapshot) = snapshot {
+                                transcribe_interim(&engine_clone, snapshot, &app_clone).await;
+                            }
+                            continue;
+                        }
                     };
 
                     match chunk {
@@ -159,6 +346,7 @@ pub fn start_transcription_task<R: Runtime>(
                             .await
                             {
                                 Ok((transcript, confidence_opt, is_partial)) => {
+                                    let transcript = apply_corrections(&transcript);
                                     let confidence_str = match confidence_opt {
                                         Some(c) => format!("{:.2}", c),
                                         None => "N/A".to_string(),
@@ -395,6 +583,47 @@ pub fn start_transcription_task<R: Runtime>(
     })
 }
 
+/// Transcribe the open segment and emit it as `transcript-interim`.
+async fn transcribe_interim<R: Runtime>(
+    engine: &TranscriptionEngine,
+    snapshot: InterimSnapshot,
+    app: &AppHandle<R>,
+) {
+    let language = crate::get_language_preference_internal();
+    let prompt = glossary_prompt();
+    let text = match (dedicated_interim_engine().await, engine) {
+        (Some(interim_engine), _) => interim_engine
+            .transcribe_with_glossary(snapshot.samples, language, prompt.as_deref(), true)
+            .await
+            .map(|(text, _, _)| text),
+        (None, TranscriptionEngine::Whisper(whisper_engine)) => whisper_engine
+            .transcribe_with_glossary(snapshot.samples, language, prompt.as_deref(), true)
+            .await
+            .map(|(text, _, _)| text),
+        (None, TranscriptionEngine::Parakeet(parakeet_engine)) => {
+            parakeet_engine.transcribe_audio(snapshot.samples).await
+        }
+        // Cloud providers bill per request; re-sending the open segment every
+        // second would multiply the bill.
+        (None, TranscriptionEngine::Provider(_)) => return,
+    };
+
+    match text {
+        Ok(text) if !text.trim().is_empty() => {
+            let update = InterimUpdate {
+                text: apply_corrections(text.trim()),
+                segment_start_time: snapshot.segment_start_ms / 1000.0,
+                audio_end_time: snapshot.end_ms / 1000.0,
+            };
+            if let Err(e) = app.emit("transcript-interim", &update) {
+                warn!("Failed to emit interim transcript: {}", e);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => warn!("Interim transcription failed: {}", e),
+    }
+}
+
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
 /// Returns: (text, confidence Option, is_partial)
 async fn transcribe_chunk_with_provider<R: Runtime>(
@@ -440,8 +669,9 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             // Get language preference from global state
             let language = crate::get_language_preference_internal();
 
+            // No glossary: identical to the stock call (no prompt, beam search).
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language)
+                .transcribe_with_glossary(speech_samples, language, glossary_prompt().as_deref(), false)
                 .await
             {
                 Ok((text, confidence, is_partial)) => {
@@ -606,3 +836,21 @@ fn format_recording_time(seconds: f64) -> String {
             assert!(!should_emit_transcript("   "));
         }
     }
+
+#[cfg(test)]
+mod hint_tests {
+    use super::replace_words_ci;
+
+    #[test]
+    fn replaces_whole_words_ignoring_case() {
+        assert_eq!(
+            replace_words_ci("So for the visa chemified tracking, Visa Chemified mission.", "visa chemified", "Visa gamified"),
+            "So for the Visa gamified tracking, Visa gamified mission."
+        );
+    }
+
+    #[test]
+    fn leaves_partial_words_alone() {
+        assert_eq!(replace_words_ci("hatchback and Hatch Journey", "hatch", "Hajj"), "hatchback and Hajj Journey");
+    }
+}

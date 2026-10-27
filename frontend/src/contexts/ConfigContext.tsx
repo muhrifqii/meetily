@@ -60,6 +60,11 @@ interface ConfigContextType {
   selectedLanguage: string;
   setSelectedLanguage: (lang: string) => void;
 
+  // Model for interim (live, grey) captions: 'same' as the final model,
+  // 'off', or a Whisper model name such as 'small'
+  interimModel: string;
+  setInterimModel: (model: string) => void;
+
   // UI preferences
   showConfidenceIndicator: boolean;
   toggleConfidenceIndicator: (checked: boolean) => void;
@@ -146,6 +151,13 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
       return saved || 'auto';
     }
     return 'auto';
+  });
+
+  const [interimModel, setInterimModel] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('interimModel') || 'same';
+    }
+    return 'same';
   });
 
   // UI preferences state
@@ -475,6 +487,24 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Sync interim caption model to Rust on mount
+  useEffect(() => {
+    invoke('set_interim_model_preference', { model: interimModel }).catch(err =>
+      console.error('[ConfigContext] Failed to sync interim model preference to Rust on startup:', err)
+    );
+  }, []);
+
+  // Persists the interim caption model and syncs it to Rust; applies from the next caption
+  const handleSetInterimModel = useCallback((model: string) => {
+    setInterimModel(model);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('interimModel', model);
+    }
+    invoke('set_interim_model_preference', { model }).catch(err =>
+      console.error('Failed to sync interim model preference to Rust:', err)
+    );
+  }, []);
+
   // Wrapper for setSelectedLanguage that persists to localStorage and syncs to Rust
   const handleSetSelectedLanguage = useCallback((lang: string) => {
     setSelectedLanguage(lang);
@@ -501,6 +531,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     setSelectedDevices,
     selectedLanguage,
     setSelectedLanguage: handleSetSelectedLanguage,
+    interimModel,
+    setInterimModel: handleSetInterimModel,
     showConfidenceIndicator,
     toggleConfidenceIndicator,
     betaFeatures,
@@ -524,6 +556,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     selectedDevices,
     selectedLanguage,
     handleSetSelectedLanguage,
+    interimModel,
+    handleSetInterimModel,
     showConfidenceIndicator,
     toggleConfidenceIndicator,
     betaFeatures,

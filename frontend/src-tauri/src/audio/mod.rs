@@ -4,6 +4,7 @@ pub mod decoder;
 pub mod encode;
 pub mod ffmpeg;
 pub mod vad;
+pub mod live_segmenter;
 
 // Modularized device management
 pub mod devices;
@@ -112,6 +113,7 @@ pub use diagnostics::{
 pub use ffmpeg_mixer::{FFmpegAudioMixer, BufferStats, RNNOISE_APPLY_ENABLED};
 
 pub use vad::{extract_speech_16k};
+pub use common::split_segment_at_silence;
 
 // Export decoder for retranscription
 pub use decoder::{decode_audio_file, DecodedAudio};

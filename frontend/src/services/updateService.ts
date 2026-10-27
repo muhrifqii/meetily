@@ -9,6 +9,9 @@ import { check, Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
 
+// Locally built fork with live-transcription changes; see checkForUpdates.
+const CUSTOM_BUILD = true;
+
 export interface UpdateInfo {
   available: boolean;
   currentVersion: string;
@@ -39,6 +42,12 @@ export class UpdateService {
    * @returns Promise with update information
    */
   async checkForUpdates(force = false): Promise<UpdateInfo> {
+    // Custom build: an official update would replace the live-transcription
+    // changes, so never offer one. Rebuild from the patched source instead.
+    if (CUSTOM_BUILD) {
+      return { available: false, currentVersion: await getVersion() };
+    }
+
     // Prevent concurrent update checks
     if (this.updateCheckInProgress) {
       throw new Error('Update check already in progress');

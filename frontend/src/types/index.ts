@@ -32,6 +32,14 @@ export interface TranscriptUpdate {
   duration: number;          // Segment duration in seconds
 }
 
+// Caption for the segment still being spoken. Superseded by the next interim,
+// and by the TranscriptUpdate whose audio_start_time equals segment_start_time.
+export interface InterimUpdate {
+  text: string;
+  segment_start_time: number; // Seconds from recording start
+  audio_end_time: number;     // Seconds from recording start
+}
+
 export interface Block {
   id: string;
   type: string;

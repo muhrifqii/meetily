@@ -23,6 +23,8 @@ export interface VirtualizedTranscriptViewProps {
     isStopping?: boolean;
     /** Enable streaming effect for latest segment */
     enableStreaming?: boolean;
+    /** Caption of the segment still being spoken, shown after the final segments */
+    interimText?: string;
     /** Show confidence indicators */
     showConfidence?: boolean;
     /** Completely disable auto-scroll behavior (for meeting details page) */
@@ -51,7 +53,7 @@ function formatRecordingTime(seconds: number | undefined): string {
 }
 
 // Helper function to remove filler words and repetitions
-function cleanStopWords(text: string): string {
+export function cleanStopWords(text: string): string {
     const stopWords = ['uh', 'um', 'er', 'ah', 'hmm', 'hm', 'eh', 'oh'];
 
     let cleanedText = text;
@@ -117,6 +119,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     isProcessing = false,
     isStopping = false,
     enableStreaming = false,
+    interimText,
     showConfidence = true,
     disableAutoScroll = false,
     hasMore = false,
@@ -220,8 +223,33 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         return () => scrollElement.removeEventListener('scroll', handleScroll);
     }, [onLoadMore, hasMore, isLoadingMore, isRecording]);
 
+    // Keep a growing interim caption in view, unless the user scrolled up to read.
+    useEffect(() => {
+        const el = scrollRef.current;
+        if (!interimText || disableAutoScroll || !el) return;
+        if (el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
+            el.scrollTop = el.scrollHeight;
+        }
+    }, [interimText, disableAutoScroll]);
+
     // Use simple rendering for small lists, virtualization for large lists
     const useVirtualization = segments.length >= VIRTUALIZATION_THRESHOLD;
+
+    const listeningIndicator = interimText ? (
+        <p className="mt-1 mb-3 pl-[58px] text-base text-gray-400 leading-relaxed">
+            {interimText}
+        </p>
+    ) : (
+        <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="flex items-center gap-2 mt-4 text-gray-500"
+        >
+            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
+            <span className="text-sm">Listening...</span>
+        </motion.div>
+    );
 
     return (
         <div ref={scrollRef} className="flex flex-col h-full overflow-y-auto px-4 py-2">
@@ -236,7 +264,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
 
             {/* Content - add padding when recording to prevent overlap */}
             <div className={isRecording ? 'pt-2' : ''}>
-            {segments.length === 0 ? (
+            {segments.length === 0 && !interimText ? (
                 // Empty state
                 <motion.div
                     initial={{ opacity: 0 }}
@@ -318,18 +346,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                         </div>
                     )}
 
-                    {/* Listening indicator when recording */}
-                    {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (
-                        <motion.div
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            className="flex items-center gap-2 mt-4 text-gray-500"
-                        >
-                            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                            <span className="text-sm">Listening...</span>
-                        </motion.div>
-                    )}
+                    {/* Interim caption, or listening indicator, when recording */}
+                    {!isStopping && isRecording && !isPaused && !isProcessing && (segments.length > 0 || interimText) && listeningIndicator}
                 </>
             ) : (
                 // Simple rendering for small lists (better animations)
@@ -374,18 +392,8 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                         </div>
                     )}
 
-                    {/* Listening indicator when recording */}
-                    {!isStopping && isRecording && !isPaused && !isProcessing && segments.length > 0 && (
-                        <motion.div
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            className="flex items-center gap-2 mt-4 text-gray-500"
-                        >
-                            <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                            <span className="text-sm">Listening...</span>
-                        </motion.div>
-                    )}
+                    {/* Interim caption, or listening indicator, when recording */}
+                    {!isStopping && isRecording && !isPaused && !isProcessing && (segments.length > 0 || interimText) && listeningIndicator}
                 </>
             )}
             </div>

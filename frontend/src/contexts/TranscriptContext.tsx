@@ -1,16 +1,24 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
-import { Transcript, TranscriptUpdate } from '@/types';
+import { Transcript, TranscriptUpdate, InterimUpdate } from '@/types';
 import { toast } from 'sonner';
 import { useRecordingState } from './RecordingStateContext';
 import { transcriptService } from '@/services/transcriptService';
 import { recordingService } from '@/services/recordingService';
 import { indexedDBService } from '@/services/indexedDBService';
+import { replaceLastWords, replaceWords } from '@/lib/corrections';
 
 interface TranscriptContextType {
   transcripts: Transcript[];
   transcriptsRef: MutableRefObject<Transcript[]>
+  /** Caption of the segment still being spoken, or null between segments */
+  interim: InterimUpdate | null;
+  /**
+   * Rewrites `from` to `to` in the transcripts shown so far, or only in its
+   * last occurrence with `onlyLast`; returns how many places changed
+   */
+  applyCorrection: (from: string, to: string, onlyLast?: boolean) => number;
   addTranscript: (update: TranscriptUpdate) => void;
   copyTranscript: () => void;
   flushBuffer: () => void;
@@ -42,6 +50,47 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
+
+  // Interim caption: replaced by each newer interim of the same segment, and
+  // cleared by the final transcript of that segment (matched on start time).
+  const [interim, setInterim] = useState<InterimUpdate | null>(null);
+  const lastFinalStartRef = useRef<number>(-1);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlisteners: (() => void)[] = [];
+
+    (async () => {
+      const unlistenInterim = await transcriptService.onTranscriptInterim((update) => {
+        // An interim computed just before its segment closed must not reappear after the final.
+        if (update.segment_start_time <= lastFinalStartRef.current + 0.01) return;
+        setInterim(update);
+      });
+      const unlistenFinal = await transcriptService.onTranscriptUpdate((update) => {
+        lastFinalStartRef.current = Math.max(lastFinalStartRef.current, update.audio_start_time);
+        setInterim(prev =>
+          prev && prev.segment_start_time <= update.audio_start_time + 0.01 ? null : prev
+        );
+      });
+      if (cancelled) {
+        unlistenInterim();
+        unlistenFinal();
+      } else {
+        unlisteners.push(unlistenInterim, unlistenFinal);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisteners.forEach(unlisten => unlisten());
+    };
+  }, []);
+
+  // Recording-relative times restart at 0 for every recording.
+  useEffect(() => {
+    setInterim(null);
+    lastFinalStartRef.current = -1;
+  }, [recordingState.isRecording]);
 
   // Smart auto-scroll: Track user scroll position
   useEffect(() => {
@@ -480,9 +529,38 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Corrections change the saved meeting too: it is written from this state on stop.
+  const applyCorrection = useCallback((from: string, to: string, onlyLast = false) => {
+    let changed = 0;
+    const current = transcriptsRef.current;
+    let next = current;
+    if (onlyLast) {
+      for (let i = current.length - 1; i >= 0; i--) {
+        const { text, count } = replaceLastWords(current[i].text, from, to);
+        if (count) {
+          next = current.map((t, j) => (j === i ? { ...t, text } : t));
+          changed = 1;
+          break;
+        }
+      }
+    } else {
+      next = current.map(t => {
+        const { text, count } = replaceWords(t.text, from, to);
+        changed += count;
+        return count ? { ...t, text } : t;
+      });
+    }
+    if (changed) {
+      transcriptsRef.current = next;
+      setTranscripts(next);
+    }
+    return changed;
+  }, []);
+
   // Clear transcripts (used when starting new recording)
   const clearTranscripts = useCallback(() => {
     setTranscripts([]);
+    setInterim(null);
     // Don't clear currentMeetingId here - it will be set by recording-started event
   }, []);
 
@@ -512,6 +590,8 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
   const value: TranscriptContextType = {
     transcripts,
     transcriptsRef,
+    interim,
+    applyCorrection,
     addTranscript,
     copyTranscript,
     flushBuffer,

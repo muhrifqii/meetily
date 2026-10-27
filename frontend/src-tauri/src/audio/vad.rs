@@ -8,6 +8,8 @@ use std::time::Duration;
 /// sample count and timestamp inside this module is expressed in it.
 const VAD_SAMPLE_RATE: u32 = 16000;
 
+const POST_SPEECH_PAD_MS: u32 = 400;
+
 /// Represents a complete speech segment detected by VAD
 #[derive(Debug, Clone)]
 pub struct SpeechSegment {
@@ -53,7 +55,7 @@ impl ContinuousVadProcessor {
         // speech delivery is tracked in #756.
         config.redemption_time = Duration::from_millis(redemption_time_ms as u64);
         config.pre_speech_pad = Duration::from_millis(300);   // Pre-speech padding for context
-        config.post_speech_pad = Duration::from_millis(400);  // Increased: more context at end
+        config.post_speech_pad = Duration::from_millis(POST_SPEECH_PAD_MS as u64);  // Increased: more context at end
 
         // CRITICAL FIX: Increased min_speech_time to prevent tiny 40ms fragments
         // Previous: 100ms allowed too-short segments that Whisper rejects
@@ -112,6 +114,36 @@ impl ContinuousVadProcessor {
         }
 
         Ok(completed_segments)
+    }
+
+    /// Change how long a silence must last to close a segment. Takes effect on the
+    /// next 30ms frame, including for a segment that is already open.
+    pub fn set_redemption_time_ms(&mut self, redemption_time_ms: u32) {
+        let config = self.session.config_mut();
+        config.redemption_time = Duration::from_millis(redemption_time_ms as u64);
+        // Silero slices the closed segment up to speech end + post pad from audio it
+        // has buffered, and it has buffered only the redemption silence past speech
+        // end. A pad longer than that indexes past the buffer and panics.
+        config.post_speech_pad =
+            Duration::from_millis(POST_SPEECH_PAD_MS.min(redemption_time_ms.saturating_sub(30)) as u64);
+    }
+
+    /// Samples of the segment that is still open, and its session-absolute start in ms.
+    pub fn active_speech(&self) -> Option<(&[f32], f64)> {
+        if !self.in_speech {
+            return None;
+        }
+        let samples = self.session.get_current_speech();
+        if samples.is_empty() {
+            return None;
+        }
+        let start_ms = self.speech_start_sample as f64 * 1000.0 / VAD_SAMPLE_RATE as f64;
+        Some((samples, start_ms))
+    }
+
+    /// Session-absolute position of the audio the VAD has seen, in ms.
+    pub fn processed_ms(&self) -> f64 {
+        self.processed_samples as f64 * 1000.0 / VAD_SAMPLE_RATE as f64
     }
 
     /// Improved resampling from input sample rate to 16kHz with anti-aliasing

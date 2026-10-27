@@ -439,6 +439,29 @@ async fn set_language_preference(language: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn set_interim_model_preference(model: String) -> Result<(), String> {
+    log_info!("Setting interim caption model to: {}", model);
+    audio::transcription::worker::set_interim_model_preference(model).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_transcription_hints(
+    terms: Vec<String>,
+    corrections: Vec<audio::transcription::worker::Correction>,
+    use_prompt: bool,
+) -> Result<(), String> {
+    log_info!(
+        "Transcription hints: {} glossary terms (prompt {}), {} corrections",
+        terms.len(),
+        if use_prompt { "on" } else { "off" },
+        corrections.len()
+    );
+    audio::transcription::worker::set_transcription_hints(terms, corrections, use_prompt);
+    Ok(())
+}
+
 // Internal helper function to get language preference (for use within Rust code)
 pub fn get_language_preference_internal() -> Option<String> {
     LANGUAGE_PREFERENCE.lock().ok().map(|lang| lang.clone())
@@ -774,6 +797,8 @@ pub fn run() {
             audio::recording_preferences::get_audio_backend_info,
             // Language preference commands
             set_language_preference,
+            set_interim_model_preference,
+            set_transcription_hints,
             // Notification system commands
             notifications::commands::get_notification_settings,
             notifications::commands::set_notification_settings,
