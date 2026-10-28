@@ -4,6 +4,10 @@
 
 set -e
 
+# whisper.cpp and llama.cpp still declare cmake_minimum_required below 3.5,
+# which CMake 4 rejects unless a policy floor is set.
+export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'

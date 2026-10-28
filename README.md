@@ -1,3 +1,47 @@
+# Meetily Custom
+
+A fork of [Meetily](https://github.com/Zackriya-Solutions/meetily) v0.4.1 with faster live transcription. Everything below this section is the original Meetily README.
+
+What changed:
+
+- **Faster live transcript.** Segments close within a second or two of a pause, even during long monologues, instead of waiting for silence. Words appear about 1.2s after they are spoken (median), down from about 4.5s, with a worst case of about 2s instead of 27s.
+- **Live captions.** Text appears while it is still being spoken and is confirmed in place. Choose a layout under **View**: Flow (paragraphs), Captions (a fixed three-line box) or Segments (the original view). Text size and dimming of unconfirmed words are also there.
+- **Lighter caption model (optional).** Settings → Live caption model: the same model as the transcript (default), Small, Base or Off.
+- **Corrections.** Select misheard words in the live transcript, choose **Correct** and type the right words. The fix is applied to the transcript and to every new sentence after it, in this and future meetings. Manage the rules under **Glossary**.
+- **No update checks**, so the app does not offer to replace itself with the official release.
+
+Only tested on macOS with Apple Silicon.
+
+## Build on macOS
+
+Install the tools once:
+
+```bash
+xcode-select --install
+brew install cmake node
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+npm install -g pnpm@9.15.9
+```
+
+Clone and build:
+
+```bash
+git clone https://github.com/yuridentadanu07/meetily.git meetily-custom
+cd meetily-custom/frontend
+pnpm install --frozen-lockfile
+./build-gpu.sh
+```
+
+The first build takes 10 to 20 minutes. The app is written to `target/release/bundle/macos/meetily.app` and a disk image to `target/release/bundle/dmg/`. Drag `meetily.app` to Applications and open it.
+
+Notes:
+
+- Run `./build-gpu.sh`, not `pnpm tauri build`: the script builds the `llama-helper` sidecar the app needs first.
+- The app uses the same bundle ID as the official Meetily, so it shares its settings, models and meeting history. Quit the official app before opening this one.
+- If you copy the built app to another Mac, macOS may block it as damaged. Run `xattr -dr com.apple.quarantine /Applications/meetily.app` once.
+
+---
+
 <div align="center" style="border-bottom: none">
     <h1>
         <img src="docs/Meetily-6.png" style="border-radius: 10px;" />
